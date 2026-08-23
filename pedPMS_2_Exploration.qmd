@@ -1,0 +1,491 @@
+---
+title: "pedPMS Proteomics 2: Exploration and analysis (workshop)"
+author: "Workshop"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    toc-title: "Table of contents"
+    code-fold: true
+    code-summary: "Code"
+    code-tools: true
+    embed-resources: true
+    fig-width: 8
+    fig-height: 5
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+editor: source
+---
+
+<!--
+  WORKSHOP EDITION (conflict-hardened), report 2 of 2. It reads the object report
+  1 saved, clusters the samples, finds proteins that mark each cluster, tests
+  those for pathway enrichment, and runs a plex-effect-free healthy-versus-disease
+  comparison inside plex 7. Run report 1 first so the .RDS exists.
+
+  Every chunk starts with "# AIM:". Read %>% as "then". Namespace clashes between
+  the tidyverse, base, matrixStats and the Bioconductor stack (igraph,
+  AnnotationDbi, clusterProfiler, MatrixGenerics ...) are resolved once in setup.
+
+  NOTE on the synthetic data: gene symbols are fictional, so they do not map to
+  org.Hs.eg.db. The enrichment sections therefore return nothing and print a clear
+  note instead of failing. On real data with real symbols they return enriched
+  terms. Always check the bitr() mapping rate before trusting an enrichment table.
+-->
+
+```{r setup}
+# AIM: load packages, resolve namespace conflicts, set the seed, find the object
+# report 1 wrote, and set analysis thresholds.
+
+library(tidyverse)
+library(matrixStats)
+library(cowplot)
+library(ggrepel)
+library(DT)
+library(SummarizedExperiment)
+library(limma)                 # linear models for differential/signature testing
+library(bluster)               # makeKNNGraph(): nearest-neighbour graph
+library(igraph)                # graph tools + community detection
+library(ComplexHeatmap)        # signature heatmap
+library(circlize)              # colorRamp2(): heatmap colour scale
+library(clusterProfiler)       # enrichGO(), bitr(): enrichment + ID conversion
+library(org.Hs.eg.db)          # human gene annotation database
+library(ReactomePA)            # enrichPathway(): Reactome enrichment (optional)
+library(here)                  # here(): locate the project root portably
+
+# --- Namespace conflicts -------------------------------------------------------
+# This report attaches more Bioconductor packages than report 1 (igraph,
+# AnnotationDbi via org.Hs.eg.db, clusterProfiler, MatrixGenerics ...), so there
+# are more clashes: select (AnnotationDbi/clusterProfiler vs dplyr), rename/slice/
+# mutate (clusterProfiler vs dplyr), rowSds/rowVars (matrixStats vs MatrixGenerics),
+# table (base vs BiocGenerics), and so on. Resolve them once, by policy:
+#   1) dplyr wins every conflict it is part of.
+#   2) pin the base / matrixStats functions we call by bare name.
+# If you add a package later and hit a "conflict" error, add one line:
+#   conflicts_prefer(thePackageYouWant::theFunction)
+library(conflicted)            # needs conflicted >= 1.1.0 for conflict_prefer_all()
+suppressMessages({
+  conflict_prefer_all("dplyr", quiet = TRUE)
+  conflicts_prefer(
+    matrixStats::rowSds, matrixStats::rowVars,      # vs MatrixGenerics
+    base::table, base::which.max, base::which.min,  # vs BiocGenerics
+    base::rowMeans, base::colMeans,
+    base::rowSums,  base::colSums,
+    stats::median,  stats::sd
+  )
+})
+
+set.seed(20240101)
+ht_opt$message = FALSE   # silence a harmless ComplexHeatmap layout note
+
+# Same project-root logic as report 1, so this report reads results/ from the
+# exact folder report 1 wrote to, on any machine and without editing a path.
+base_dir <- here::here()
+
+params_local <- list(
+  # find the newest object report 1 wrote, by pattern, so the two reports never
+  # drift apart on the date in the file name. local({...}) runs the search once.
+  se_rds     = local({
+    f <- list.files(file.path(base_dir, "results"),
+                    pattern = "_pedPMSproteomics\\.summarizedExperiment\\.RDS$",
+                    full.names = TRUE)
+    if (length(f) == 0) stop("No RDS found in ", file.path(base_dir, "results"),
+                             ". Run report 1 first.", call. = FALSE)
+    f[which.max(file.mtime(f))]
+  }),
+  out_dir    = file.path(base_dir, "results"),
+  n_var_prot = 1000,
+  knn_k      = 10,
+  fdr_cutoff = 0.05,
+  lfc_cutoff = 1.0
+)
+
+dt_table <- function(x) {
+  DT::datatable(x, filter = "top",
+                options = list(autoWidth = FALSE, scrollX = TRUE),
+                class = "compact hover row-border stripe dt-left cell-border nowrap")
+}
+
+# AIM: build the output folder tree (shared with report 1). Tables go under
+# results/tables, image files under results/figures.
+dirs <- list(
+  root    = params_local$out_dir,
+  tables  = file.path(params_local$out_dir, "tables"),
+  figures = file.path(params_local$out_dir, "figures"))
+for (p in dirs) dir.create(p, showWarnings = FALSE, recursive = TRUE)
+
+# save a data frame to results/tables and return it unchanged (for piping to dt_table).
+save_table <- function(x, name) {
+  readr::write_csv(x, file.path(dirs$tables, name))
+  x
+}
+# save a ggplot to results/figures and return it unchanged (still displays).
+save_ggplot <- function(p, name, w = 8, h = 5) {
+  ggplot2::ggsave(file.path(dirs$figures, name), p, width = w, height = h,
+                  dpi = 150, bg = "white")
+  p
+}
+```
+
+# Introduction
+
+This report explores the normalised pedPMS proteome saved by report 1. It groups
+samples by their protein profiles, describes each group, and tests those groups
+for enriched pathways. It closes with a targeted, plex-effect-free comparison of
+the six healthy controls against the disease samples that share their plex.
+
+```{r load-se}
+# AIM: load the object and unpack it into the matrix, sample metadata and protein
+# annotation, then build the feature matrix used for clustering.
+se <- readRDS(params_local$se_rds)
+prot.aml       <- assay(se, "protein_unimputed")
+meta.aml       <- as_tibble(colData(se), rownames = "label_id")
+prot.annotation <- as_tibble(rowData(se))
+
+# lookup from protein id to gene symbol (first symbol if several).
+uniprotid_to_gene <- prot.annotation %>%
+  dplyr::mutate(gene = str_split_i(gene, ";", 1)) %>%
+  dplyr::select(uniprotid, gene) %>% deframe()
+
+# feature matrix: complete proteins, centred, top 1000 most variable.
+prot.complete <- prot.aml[complete.cases(prot.aml), ]
+prot.centred  <- prot.complete - rowMeans(prot.complete)
+top_var <- prot.centred[order(matrixStats::rowVars(prot.centred), decreasing = TRUE)[
+  seq_len(params_local$n_var_prot)], ]
+```
+
+`r nrow(prot.complete)` proteins are complete across all `r ncol(prot.aml)`
+samples; the `r params_local$n_var_prot` most variable are used for clustering.
+(Complete-case filtering drops any protein missing in even one plex block, so the
+clustered feature set is biased toward ubiquitously detected proteins; this is the
+price of not imputing blockwise-missing data.)
+
+# Clustering
+
+```{r knn-and-community}
+# AIM: compress to 10 PCs, connect each sample to its 10 nearest neighbours, and
+# detect communities (groups more connected internally than externally).
+
+pca_fit <- prcomp(t(top_var), center = TRUE, scale. = FALSE)
+latent  <- pca_fit$x[, 1:10]
+
+knn_graph <- bluster::makeKNNGraph(latent, k = params_local$knn_k)
+igraph::V(knn_graph)$name <- meta.aml$label_id
+
+communities <- igraph::cluster_louvain(knn_graph)
+meta.aml$community <- factor(igraph::membership(communities))
+
+tibble(measure = c("modularity", "n communities"),
+       value = c(round(igraph::modularity(communities), 3), length(communities))) %>%
+  dt_table()
+
+# cross the communities against subtype and against plex. The community-vs-plex
+# table is the honest check: a community that is essentially one plex may be a
+# batch artifact rather than biology.
+table(meta.aml$subtype, meta.aml$community)
+table(meta.aml$plex, meta.aml$community)
+```
+
+```{r cluster-stability}
+# AIM: check the clustering is stable by re-running it on random 80% subsets of
+# the proteins and measuring how often sample pairs change co-membership (Hamming
+# distance). Low values mean a trustworthy partition. NB this tests robustness to
+# dropping proteins only, not to the choice of k or the number of PCs.
+co_membership <- function(cl) outer(cl, cl, "==") * 1
+reference_co <- co_membership(as.integer(igraph::membership(communities)))
+
+hamming_runs <- map_dbl(1:100, function(i) {
+  idx <- sample(nrow(top_var), floor(0.8 * nrow(top_var)))
+  pc_b <- prcomp(t(top_var[idx, ]), center = TRUE, scale. = FALSE)$x[, 1:10]
+  cl_b <- igraph::membership(igraph::cluster_louvain(bluster::makeKNNGraph(pc_b, k = params_local$knn_k)))
+  mean(co_membership(as.integer(cl_b)) != reference_co)
+})
+
+tibble(hamming = hamming_runs) %>%
+  ggplot(aes(x = hamming)) + geom_histogram(bins = 25) +
+  geom_vline(xintercept = mean(hamming_runs), linetype = "dashed", col = "blue") +
+  cowplot::theme_minimal_grid() + cowplot::panel_border() +
+  labs(x = "Hamming distance to full-feature partition", y = "",
+       caption = paste0("mean ", round(mean(hamming_runs), 3), " over 100 resamplings"))
+```
+
+# Cluster investigation
+
+```{r cluster-assignments}
+# AIM: show each sample's cluster next to its subtype and plex.
+meta.aml %>%
+  dplyr::select(label_id, tube_id, subtype, group, plex, community) %>% dt_table()
+```
+
+## Signature proteins per cluster
+
+```{r signature-model}
+# AIM: for each cluster, find proteins higher (or lower) in it than in all other
+# clusters combined, using limma (the standard group-comparison tool).
+#
+# NOTE on interpretation: cluster membership was derived from these same samples,
+# so the p-values / FDR below are optimistic (double-dipping). Treat the output as
+# a ranked hypothesis list, not validated inference.
+
+design <- model.matrix(~ 0 + meta.aml$community)
+colnames(design) <- paste0("C", levels(meta.aml$community))
+fit <- lmFit(prot.complete, design)
+
+n_per <- table(meta.aml$community)
+one_vs_rest <- map_chr(colnames(design), function(cn) {
+  others <- setdiff(colnames(design), cn)
+  w <- n_per[str_remove(others, "C")] / sum(n_per[str_remove(others, "C")])
+  paste0(cn, " - (", paste(sprintf("%.6f*%s", w, others), collapse = " + "), ")")
+})
+names(one_vs_rest) <- colnames(design)
+contrast_matrix <- makeContrasts(contrasts = one_vs_rest, levels = design)
+colnames(contrast_matrix) <- names(one_vs_rest)
+fit2 <- eBayes(contrasts.fit(fit, contrast_matrix))   # eBayes shares variance across proteins
+
+signature_results <- map_dfr(colnames(contrast_matrix), function(cn) {
+  topTable(fit2, coef = cn, number = Inf, sort.by = "none", confint = TRUE) %>%
+    as_tibble(rownames = "uniprotid") %>%
+    dplyr::mutate(community = cn, gene = uniprotid_to_gene[uniprotid]) %>%
+    dplyr::rename(FDR = adj.P.Val, P = P.Value)
+})
+
+# save the full results and the significant subset (with P and FDR) to tables.
+# The significant table is a HYPOTHESIS list (see the double-dipping note above).
+signature_results %>%
+  dplyr::select(community, gene, uniprotid, logFC, CI.L, CI.R, P, FDR) %>%
+  dplyr::arrange(community, P) %>%
+  save_table("signature_proteins_all.csv")
+
+signature_significant <- signature_results %>%
+  dplyr::filter(FDR < params_local$fdr_cutoff, abs(logFC) > params_local$lfc_cutoff) %>%
+  dplyr::select(community, gene, uniprotid, logFC, CI.L, CI.R, P, FDR) %>%
+  dplyr::arrange(community, P)
+save_table(signature_significant, "signature_proteins_significant.csv")
+```
+
+```{r signature-heatmap, fig.height=9}
+# AIM: heatmap of the strongest signature proteins, with subtype and plex on top.
+signature_ids <- signature_results %>%
+  dplyr::filter(FDR < params_local$fdr_cutoff, abs(logFC) > params_local$lfc_cutoff) %>%
+  group_by(community) %>% slice_max(abs(logFC), n = 15) %>%
+  pull(uniprotid) %>% unique()
+
+mat <- prot.centred[signature_ids, ]
+mat <- (mat - rowMeans(mat)) / matrixStats::rowSds(mat)   # z-score each protein
+rownames(mat) <- uniprotid_to_gene[signature_ids]
+
+sig_heatmap <- ComplexHeatmap::Heatmap(
+  mat, name = "z-score",
+  col = circlize::colorRamp2(c(-2.5, 0, 2.5), c("#2166ac", "white", "#b2182b")),
+  column_split = meta.aml$community,
+  top_annotation = HeatmapAnnotation(subtype = meta.aml$subtype,
+                                     plex = factor(meta.aml$plex)),
+  row_names_gp = gpar(fontsize = 6), show_column_names = FALSE)
+
+# ComplexHeatmap is not a ggplot, so save it through a PNG device explicitly.
+png(file.path(dirs$figures, "03_signature_heatmap.png"),
+    width = 9, height = 9, units = "in", res = 150)
+ComplexHeatmap::draw(sig_heatmap)
+invisible(dev.off())
+
+sig_heatmap    # display in the report
+```
+
+## Over-representation analysis (ORA)
+
+```{r ora-setup}
+# AIM: set up ORA. The background universe is the tested proteins (converted to
+# gene ids), NOT the whole genome, so abundant proteins are not called enriched
+# just for being detectable.
+#
+# Symbols are converted to Entrez ids with bitr(). On the synthetic data the
+# symbols are fictional and map to nothing, so the universe is empty; we detect
+# that and let the enrichment sections skip cleanly with a clear note.
+universe_symbols <- uniprotid_to_gene[rownames(prot.complete)] %>% na.omit() %>% unique()
+universe_entrez <- suppressWarnings(
+  clusterProfiler::bitr(universe_symbols, "SYMBOL", "ENTREZID", org.Hs.eg.db)$ENTREZID)
+
+if (length(universe_entrez) == 0)
+  message("No gene symbols mapped to Entrez IDs; ORA will be empty. ",
+          "Expected on the synthetic data (fictional symbols). On real data, ",
+          "check what fraction of your symbols bitr() maps before trusting ORA.")
+
+hits_for <- function(cn, direction = c("up", "down")) {
+  direction <- match.arg(direction)
+  g <- signature_results %>%
+    dplyr::filter(community == cn, FDR < params_local$fdr_cutoff,
+                  if (direction == "up") logFC > params_local$lfc_cutoff
+                  else logFC < -params_local$lfc_cutoff) %>%
+    pull(gene) %>% na.omit() %>% unique()
+  if (length(g) < 10) return(NULL)
+  ids <- suppressWarnings(
+    clusterProfiler::bitr(g, "SYMBOL", "ENTREZID", org.Hs.eg.db)$ENTREZID)
+  if (length(ids) < 10) return(NULL)   # too few mapped to test meaningfully
+  ids
+}
+```
+
+```{r ora-go}
+# AIM: GO biological-process enrichment for each cluster's up-proteins. Skipped
+# cleanly when the universe is empty (fictional symbols) or too few genes map.
+go_results <- if (length(universe_entrez) == 0) list() else
+  map(set_names(colnames(contrast_matrix)), function(cn) {
+    h <- hits_for(cn, "up"); if (is.null(h)) return(NULL)
+    clusterProfiler::enrichGO(h, OrgDb = org.Hs.eg.db, ont = "BP",
+                              universe = universe_entrez, pAdjustMethod = "BH",
+                              qvalueCutoff = 0.1, readable = TRUE)
+  }) %>% compact()
+
+if (length(go_results) == 0) {
+  cat("No GO enrichment to show. With the synthetic data's fictional gene ",
+      "symbols, none map to Entrez IDs, so the enrichment universe is empty. ",
+      "On real data with real symbols this section returns enriched terms per ",
+      "community.\n", sep = "")
+} else {
+  map_dfr(names(go_results), ~ as_tibble(go_results[[.x]]) %>% dplyr::mutate(community = .x)) %>%
+    dplyr::select(community, Description, GeneRatio, BgRatio, p.adjust, qvalue, geneID) %>%
+    save_table("ora_GO_by_community.csv") %>%
+    dt_table()
+}
+```
+
+# NEW: plex-7 healthy-versus-disease, free of plex effect
+
+This is the analysis the extra controls make possible. Plex 7 holds all six
+healthy controls and three disease samples, so a comparison confined to plex 7
+carries no plex effect at all. Any protein that differs here differs for
+biological reasons, not because of the batch. It is a small comparison (nine
+samples), so treat it as a focused sensitivity check whose top hits are
+candidates for validation, not a definitive disease signature. Note also that
+three of the six controls are synthetic and were modelled on the real ones with
+smaller sample-to-sample spread, so the number of significant proteins here is
+sensitive to their inclusion (see the companion exercise).
+
+```{r plex7-differential}
+# AIM: inside plex 7 only, test which proteins differ between the 6 controls and
+# the 3 disease samples. Because every sample here is in the same plex, the result
+# is free of the plex/batch effect that confounds the whole-cohort comparison.
+
+# pick the plex-7 samples and split them into control vs disease.
+p7 <- meta.aml %>% dplyr::filter(plex == 7)
+p7_mat <- prot.aml[, p7$label_id]
+# keep proteins measured in every plex-7 sample (a fair within-plex comparison).
+p7_mat <- p7_mat[complete.cases(p7_mat), ]
+
+grp <- factor(p7$group, levels = c("control", "disease"))
+design7 <- model.matrix(~ grp)          # intercept = control; 2nd column = disease effect
+
+# limma with eBayes: stabilises per-protein variance, important with few samples.
+fit7 <- eBayes(lmFit(p7_mat, design7))
+res7 <- topTable(fit7, coef = 2, number = Inf, confint = TRUE) %>%
+  as_tibble(rownames = "uniprotid") %>%
+  dplyr::mutate(gene = uniprotid_to_gene[uniprotid]) %>%
+  dplyr::rename(FDR = adj.P.Val, P = P.Value) %>%
+  dplyr::arrange(P)
+
+cat("plex-7 samples: ", nrow(p7), " (",
+    sum(p7$group == "control"), " control, ",
+    sum(p7$group == "disease"), " disease); proteins tested: ",
+    nrow(p7_mat), "\n", sep = "")
+
+# save the full plex-7 result (every protein, with P and FDR) and the significant
+# subset, sorted by P, to results/tables.
+res7 %>%
+  dplyr::select(gene, uniprotid, logFC, CI.L, CI.R, P, FDR) %>%
+  save_table("plex7_healthy_vs_disease_all.csv")
+
+res7 %>%
+  dplyr::filter(FDR < params_local$fdr_cutoff, abs(logFC) > params_local$lfc_cutoff) %>%
+  dplyr::select(gene, uniprotid, logFC, CI.L, CI.R, P, FDR) %>%
+  save_table("plex7_healthy_vs_disease_significant.csv")
+
+# show the top 40 by p-value in the report.
+res7 %>% dplyr::select(gene, uniprotid, logFC, CI.L, CI.R, P, FDR) %>%
+  dplyr::slice(1:40) %>% dt_table()
+```
+
+```{r plex7-volcano, fig.height=5}
+# AIM: volcano plot of the plex-7 comparison. x = size of the difference (logFC),
+# y = evidence against no-difference (-log10 P). Points top-left/right are the
+# strongest candidates.
+volcano7 <- res7 %>%
+  dplyr::mutate(sig = FDR < params_local$fdr_cutoff & abs(logFC) > params_local$lfc_cutoff) %>%
+  ggplot(aes(x = logFC, y = -log10(P), col = sig)) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_color_manual(values = c(`FALSE` = "grey70", `TRUE` = "firebrick"),
+                     name = "passes cutoff") +
+  ggrepel::geom_text_repel(
+    data = ~ dplyr::slice(dplyr::arrange(.x, P), 1:15),
+    aes(label = gene), size = 3, max.overlaps = 20, show.legend = FALSE) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", col = "grey50") +
+  cowplot::theme_minimal_grid() + cowplot::panel_border() +
+  labs(x = "log2 fold change (disease vs control)", y = "-log10 P",
+       title = "Plex-7 healthy vs disease (no plex effect)")
+save_ggplot(volcano7, "04_plex7_volcano.png", w = 7, h = 5)
+volcano7
+```
+
+```{r plex7-enrichment}
+# AIM: pathway enrichment on the plex-7 up-in-disease proteins, same tested-
+# proteome background as above. Guarded on the ID mapping, not just the hit count,
+# so it skips cleanly when the fictional symbols do not map.
+p7_up <- res7 %>%
+  dplyr::filter(FDR < params_local$fdr_cutoff, logFC > params_local$lfc_cutoff) %>%
+  pull(gene) %>% na.omit() %>% unique()
+
+ids <- if (length(p7_up)) suppressWarnings(
+  clusterProfiler::bitr(p7_up, "SYMBOL", "ENTREZID", org.Hs.eg.db)$ENTREZID) else character(0)
+
+if (length(ids) >= 10 && length(universe_entrez) > 0) {
+  ego7 <- clusterProfiler::enrichGO(ids, OrgDb = org.Hs.eg.db, ont = "BP",
+                                    universe = universe_entrez, pAdjustMethod = "BH",
+                                    qvalueCutoff = 0.1, readable = TRUE)
+  as_tibble(ego7) %>%
+    dplyr::select(Description, GeneRatio, BgRatio, p.adjust, qvalue, geneID) %>%
+    save_table("plex7_enrichment_GO.csv") %>%
+    dt_table()
+} else {
+  cat("Enrichment skipped:", length(ids), "of", length(p7_up),
+      "significant up-in-disease genes mapped to Entrez IDs",
+      "(fictional symbols do not map). Expected on the synthetic data.\n")
+}
+```
+
+# Summary and outlook
+
+```{r summary-numbers}
+n_communities <- length(communities)
+n_p7_sig <- sum(res7$FDR < params_local$fdr_cutoff &
+                abs(res7$logFC) > params_local$lfc_cutoff)
+```
+
+Louvain clustering on the `r params_local$n_var_prot` most variable proteins gave
+`r n_communities` communities across `r ncol(prot.aml)` samples, with mean Hamming
+distance `r round(mean(hamming_runs), 3)` over 100 resamplings. The plex-7
+comparison, which is free of plex effect, returned `r n_p7_sig` proteins passing
+the fold-change and FDR cutoffs. That count depends on the three synthetic,
+low-variance controls; with the three real controls only it drops to near zero, so
+it should be read as a candidate list, not a result.
+
+What this report supports and what it does not:
+
+The cluster structure and its signature proteins are exploratory. Membership was
+derived from the same data used to test it, so those proteins are a ranked
+hypothesis list, not a validated signature. Where a cluster lines up with a single
+plex, its signature cannot be attributed to biology from this dataset alone; the
+plex annotation on the heatmap is the check for that.
+
+The plex-7 comparison is the one contrast here that is structurally free of plex
+effect, which is exactly why the extra controls were added to that plex. It is
+small and leans on synthetic controls, so its value is in nominating candidates
+for an independent experiment, not in settling anything by itself.
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

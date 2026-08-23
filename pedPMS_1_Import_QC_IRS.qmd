@@ -1,0 +1,661 @@
+---
+title: "pedPMS Proteomics 1: Import, QC and reference-channel IRS (workshop)"
+author: "Workshop"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    toc-title: "Table of contents"
+    code-fold: true
+    code-summary: "Code"
+    code-tools: true
+    embed-resources: true
+    fig-width: 8
+    fig-height: 5
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+  cache: false
+editor: source
+---
+
+<!--
+  WORKSHOP EDITION (conflict-hardened). This is the first of two reports. It reads
+  the raw workshop files, builds the sample metadata, checks data quality, runs
+  internal reference scaling (IRS) using the pooled reference channel, and saves
+  one tidy object for the second report to analyse.
+
+  Every code chunk starts with "# AIM:" saying WHY it exists, and the harder
+  functions carry a one-line plain-language comment. Read a pipe (%>%) as the
+  word "then": x %>% f() %>% g() means take x, then do f, then do g.
+
+  WHICH INPUT FILE. Set params_local$data_txt to one of:
+    - pedPMS_data_preIRS.txt  : reference present, plexes NOT yet aligned. IRS
+                                below does real work. Use this to LEARN IRS.
+    - pedPMS_data_postIRS.txt : reference present, already aligned. IRS below is
+                                almost a no-op. Use this to VERIFY IRS was done.
+    - pedPMS_data.txt         : no reference channel. IRS cannot be recomputed;
+                                the script verifies alignment diagnostically.
+  The same code runs on any of them; only the story changes.
+-->
+
+```{r setup}
+# AIM: load packages, resolve namespace conflicts, set the reproducibility seed,
+# and define paths, thresholds and small helpers used later.
+
+library(tidyverse)             # dplyr / ggplot2 / stringr / tidyr / purrr
+library(readxl)                # read_excel(): read .xlsx spreadsheets
+library(matrixStats)           # fast rowSds / rowVars / colSums on matrices
+library(cowplot)               # cleaner ggplot themes
+library(ggExtra)               # ggMarginal(): marginal histograms on a scatter
+library(ggpubr)                # stat_cor(): correlation printed on a plot
+library(ggrepel)               # non-overlapping text labels
+library(rstatix)               # tidy statistical tests
+library(pcaMethods)            # pca(): PCA that tolerates missing values
+library(DT)                    # datatable(): interactive HTML tables
+library(SummarizedExperiment)  # container bundling matrix + metadata
+library(here)                  # here(): locate the project root portably
+
+# --- Namespace conflicts -------------------------------------------------------
+# Bioconductor packages (here SummarizedExperiment, which attaches S4Vectors,
+# IRanges, BiocGenerics, MatrixGenerics ...) export functions with the same names
+# as the tidyverse and base R: select, filter, slice, rename, rowSds, rowVars,
+# table, and more. The conflicted package turns each such clash into an explicit
+# error the first time you CALL the ambiguous name, so a script that runs today
+# can fail tomorrow when a new package is attached. Resolve it once, by policy:
+#   1) dplyr wins every conflict it is part of (all the tidyverse verbs).
+#   2) pin the base / matrixStats functions we call by bare name that a
+#      Bioconductor generic would otherwise mask.
+# If you attach another package later and hit a "conflict" error, add one line:
+#   conflicts_prefer(thePackageYouWant::theFunction)
+library(conflicted)            # needs conflicted >= 1.1.0 for conflict_prefer_all()
+suppressMessages({
+  conflict_prefer_all("dplyr", quiet = TRUE)
+  conflicts_prefer(
+    matrixStats::rowSds, matrixStats::rowVars,      # vs MatrixGenerics
+    base::table, base::which.max, base::which.min,  # vs BiocGenerics
+    base::rowMeans, base::colMeans,
+    base::rowSums,  base::colSums,
+    stats::median,  stats::sd
+  )
+})
+
+set.seed(20240101)   # fixes randomness so results are identical each run
+
+# --- Project location ----------------------------------------------------------
+# Base folder for the whole workshop, so data_raw/ and results/ always resolve to
+# the same place whether you Render the .qmd, run it line by line, or clone the
+# repo onto a different machine. here::here() finds the project root by looking
+# for a .git folder or an .Rproj file above the current working directory, so
+# this line needs no editing after `git clone` on Windows, Mac or Linux. If you
+# ever run chunks from a subfolder, keep the working directory at the repo root
+# (open the .Rproj, or in RStudio: Session > Set Working Directory > To Project
+# Directory) so here() has something to find.
+base_dir <- here::here()
+
+# All paths and thresholds in one place. file.path() joins with "/" for you.
+# The metadata is now read from CSV (pedPMS_Samples.csv and
+# pedPMS_Protein_samples_Batch_1.csv). If you prefer the .xlsx sheets, point these
+# back at the .xlsx files and swap the two read_csv() calls in metadata-import
+# back to read_excel().
+params_local <- list(
+  data_txt      = file.path(base_dir, "data_raw", "pedPMS_data_preIRS.txt"), # pre/post/plain
+  sample_sheet  = file.path(base_dir, "data_raw", "pedPMS_Samples.csv"),
+  prep_sheet    = file.path(base_dir, "data_raw", "pedPMS_Protein_samples_Batch_1.csv"),
+  out_dir       = file.path(base_dir, "results"),
+  max_missing   = 50,   # drop a protein if missing in more than this % of samples
+  ref_channel   = 11,   # channel carrying the pooled reference in every plex
+  tmt_tags      = c("126", "127N", "127C", "128N", "128C",
+                    "129N", "129C", "130N", "130C", "131")
+)
+
+# AIM: build the output folder tree. Everything the report writes goes here:
+# the saved object at the top level, CSV tables under results/tables, and image
+# files under results/figures. recursive = TRUE makes parent folders as needed.
+dirs <- list(
+  root    = params_local$out_dir,
+  tables  = file.path(params_local$out_dir, "tables"),
+  figures = file.path(params_local$out_dir, "figures"))
+for (p in dirs) dir.create(p, showWarnings = FALSE, recursive = TRUE)
+
+# reused interactive-table helper.
+dt_table <- function(x) {
+  DT::datatable(x, filter = "top",
+                options = list(autoWidth = FALSE, scrollX = TRUE),
+                class = "compact hover row-border stripe dt-left cell-border nowrap")
+}
+
+# save a data frame to results/tables as CSV, and return it unchanged so it can
+# still be piped into dt_table() for display. One call both saves and shows.
+save_table <- function(x, name) {
+  readr::write_csv(x, file.path(dirs$tables, name))
+  x
+}
+
+# save a ggplot to results/figures as PNG, and return it unchanged so it still
+# displays in the report.
+save_ggplot <- function(p, name, w = 8, h = 5) {
+  ggplot2::ggsave(file.path(dirs$figures, name), p, width = w, height = h,
+                  dpi = 150, bg = "white")
+  p
+}
+```
+
+# Introduction
+
+This report imports the pedPMS TMT proteomics dataset, checks its quality, and
+normalises it across plexes using a pooled reference channel. The dataset is
+synthetic and built for teaching, but its structure matches a real TMT
+experiment: 66 biological samples labelled with TMT tags, run in 7 plexes, each
+plex injected twice into the mass spectrometer, plus one pooled reference channel
+per plex used to align the plexes.
+
+Two properties of the data shape everything below and are worth stating now.
+
+Samples were assigned to plexes in tube order, so disease subtype tracks plex.
+That confounding is quantified in its own subsection and it limits how subtype
+contrasts can be read later.
+
+Six of the 66 samples are healthy controls, and all six sit in plex 7 together
+with three disease samples. Plex 7 is therefore the one place a healthy-versus-
+disease comparison carries no plex effect, which the second report uses.
+
+# Data Carpentry and Metadata
+
+```{r metadata-import}
+# AIM: turn the two CSVs into one clean metadata table, meta.aml, with one row per
+# biological sample. Robust version: reads CSV with every column pinned to text
+# (so tube ids like 1, 2 are not re-guessed as numbers), detects the sample rows
+# rather than assuming exactly 66, trims ids, and names any mismatch instead of a
+# bare stopifnot.
+
+# normalise an id: trim whitespace, strip a trailing .0 / .00, empty -> NA.
+norm_id <- function(x) {
+  x <- trimws(as.character(x))
+  x <- sub("\\.0+$", "", x)
+  x[x == "" | x == "NA"] <- NA_character_
+  x
+}
+all_text <- readr::cols(.default = readr::col_character())   # pin every column to text
+
+# labelling layout (Listen sheet, exported to CSV): no header row, so col_names =
+# FALSE. Rows 1-3 are reagent notes; drop them, keep the columns we use, fill the
+# plex label down its block, then keep only rows that carry a tube id.
+sheet_raw <- readr::read_csv(params_local$sample_sheet, col_names = FALSE,
+                             col_types = all_text, show_col_types = FALSE)
+
+sample_layout <- sheet_raw[-(1:3), c(1, 3, 4, 5, 6)]
+colnames(sample_layout) <- c("label_id", "tmt_tag", "plex_label",
+                             "plex_id", "tube_id")
+sample_layout <- sample_layout %>%
+  fill(plex_label, plex_id) %>%                              # plex written once; copy down
+  dplyr::filter(!is.na(tube_id) & trimws(tube_id) != "") %>% # real sample rows only
+  dplyr::mutate(
+    plex     = as.integer(str_remove(plex_label, "\\.Plex")),  # "7.Plex" -> 7
+    plex_key = str_remove(plex_id, "^PX-"),                    # "PX-598" -> "598"
+    channel  = match(tmt_tag, params_local$tmt_tags),          # tag -> position 1-10
+    tube_id  = norm_id(tube_id))
+
+# prep/sorting record (LIST sheet, exported to CSV): has a header row (col_names
+# default TRUE). Keep rows that carry a tube id.
+prep_meta <- readr::read_csv(params_local$prep_sheet,
+                             col_types = all_text, show_col_types = FALSE) %>%
+  dplyr::select(tube_id = 1, cell_number = 2, lysis_volume = 3, subtype = 4) %>%
+  dplyr::filter(!is.na(tube_id) & trimws(tube_id) != "") %>%
+  dplyr::mutate(cell_number = as.numeric(cell_number),
+                tube_id     = norm_id(tube_id))
+
+# safety gate: name the mismatched tubes instead of a bare stopifnot, so a broken
+# join tells you exactly which samples are out of sync rather than failing blind.
+only_layout <- setdiff(sample_layout$tube_id, prep_meta$tube_id)
+only_prep   <- setdiff(prep_meta$tube_id, sample_layout$tube_id)
+if (length(only_layout) || length(only_prep)) {
+  stop("Tube ids differ between the two metadata files.\n",
+       "  layout n = ", nrow(sample_layout),
+       ", prep n = ", nrow(prep_meta), "\n",
+       "  in layout only: ", paste(only_layout, collapse = ", "), "\n",
+       "  in prep only:   ", paste(only_prep,   collapse = ", "), "\n",
+       "  Use the matching versions of both files in data_raw/.",
+       call. = FALSE)
+}
+stopifnot(!any(is.na(sample_layout$channel)),
+          n_distinct(sample_layout$label_id) == nrow(sample_layout))
+
+meta.aml <- sample_layout %>%
+  dplyr::left_join(prep_meta, by = "tube_id") %>%
+  dplyr::mutate(subtype = factor(subtype),
+                group   = if_else(subtype == "control", "control", "disease")) %>%
+  dplyr::select(label_id, tube_id, plex, plex_id, plex_key, tmt_tag, channel,
+                subtype, group, cell_number, lysis_volume)
+```
+
+## Metadata summary
+
+```{r metadata-summary}
+# AIM: show the finished metadata table and two overview plots.
+meta.aml %>% dt_table()
+```
+
+```{r metadata-plots, fig.height=4}
+meta.aml %>%
+  ggplot(aes(x = cell_number)) +
+  geom_histogram(bins = 20) +
+  cowplot::theme_minimal_grid() + cowplot::panel_border() +
+  labs(title = "Viable cells at lysis", x = "cells (x10^6)", y = "")
+
+meta.aml %>%
+  dplyr::count(subtype) %>%
+  ggplot(aes(x = fct_reorder(subtype, n), y = n, fill = subtype == "control")) +
+  geom_col(show.legend = FALSE) + coord_flip() +
+  scale_fill_manual(values = c("grey40", "steelblue")) +
+  cowplot::theme_cowplot() +
+  labs(x = "", y = "samples", title = "Subtype (controls highlighted)")
+```
+
+## Proteomics data
+
+```{r proteomics-import}
+# AIM: read the intensity matrix and split it into three parts: the biological
+# matrix (prot.aml), the pooled-reference matrix (prot.ref), and the per-protein
+# annotation. The reference is a technical channel, so it must NOT go through the
+# sample metadata join (it has no patient behind it).
+
+raw <- read_tsv(params_local$data_txt, skip = 1,
+                locale = locale(encoding = "UTF-16LE"),
+                show_col_types = FALSE)
+
+# every "channel Rrep_plex" column
+all_cols <- grep("^\\d+ R[12]_\\d+$", colnames(raw), value = TRUE)
+# reference = the reference channel (11); biology = channels 1-10.
+ref_pat  <- paste0("^", params_local$ref_channel, " R[12]_\\d+$")
+ref_cols <- all_cols[str_detect(all_cols, ref_pat)]
+sample_cols <- setdiff(all_cols, ref_cols)
+
+prot.annotation <- raw %>%
+  dplyr::select(uniprotid = `Uniprot IDs`, gene = `Gene names`,
+                protein = `Protein names`, peptides = Peptides,
+                unique_peptides = `Unique peptides`,
+                coverage = `Sequence coverage [%]`,
+                mol_weight = `Mol. weight [kDa]`, qvalue = `Q-value`, score = Score)
+
+# biological matrix: proteins x 132 columns (66 samples x 2 injections)
+prot.aml <- raw %>% dplyr::select(all_of(sample_cols)) %>% as.matrix()
+rownames(prot.aml) <- raw$`Uniprot IDs`
+
+# reference matrix: proteins x 14 columns (7 plexes x 2 injections)
+prot.ref <- raw %>% dplyr::select(all_of(ref_cols)) %>% as.matrix()
+rownames(prot.ref) <- raw$`Uniprot IDs`
+
+# describe the reference columns so we can group them by plex during IRS.
+ref.meta <- tibble(sample = ref_cols) %>%
+  dplyr::mutate(replicate = str_extract(sample, "R[12]"),
+                plex_key  = str_extract(sample, "\\d+$"))
+
+# describe the 132 biological columns and attach sample info.
+meta.cols <- tibble(sample = sample_cols) %>%
+  dplyr::mutate(channel  = as.integer(str_extract(sample, "^\\d+")),
+                replicate = factor(str_extract(sample, "R[12]"), levels = c("R1","R2")),
+                plex_key = str_extract(sample, "\\d+$")) %>%
+  dplyr::left_join(dplyr::select(meta.aml, label_id, plex_key, channel, subtype,
+                                 plex, tube_id, cell_number),
+                   by = c("plex_key", "channel"))
+
+# checks: every biological column maps to a sample; no duplicate proteins; values
+# positive and finite; every expected column present.
+stopifnot(!any(is.na(meta.cols$label_id)),
+          !any(duplicated(rownames(prot.aml))),
+          all(prot.aml > 0, na.rm = TRUE),
+          !any(is.infinite(prot.aml)),
+          all(c(paste0(meta.aml$channel, " R1_", meta.aml$plex_key),
+                paste0(meta.aml$channel, " R2_", meta.aml$plex_key)) %in%
+              colnames(prot.aml)))
+```
+
+`r nrow(prot.aml)` protein groups across `r ncol(prot.aml)` biological columns
+(66 samples, each injected twice) plus `r ncol(prot.ref)` reference columns
+(7 plexes, each injected twice). Values are strictly positive linear-scale
+reporter intensities, so a single log2 transform is used later and no pseudocount.
+
+### Normalization
+
+TMT normalisation has two steps. Sample loading (SL) equalises the total signal
+per sample. Internal reference scaling (IRS) aligns the plexes to each other using
+the pooled reference channel. We check SL and then run IRS.
+
+#### Sample loading (verification)
+
+```{r sl-check}
+# AIM: check that each sample carries a similar total signal. If loading is
+# equalised, the column sums are all close and their CV is small.
+
+sl_plot <- tibble(sample = colnames(prot.aml),
+       col_sum = colSums(prot.aml, na.rm = TRUE)) %>%
+  dplyr::left_join(meta.cols, by = "sample") %>%
+  ggplot(aes(x = fct_reorder(sample, plex), y = col_sum, fill = factor(plex))) +
+  geom_col() + scale_fill_viridis_d(name = "Plex") +
+  cowplot::theme_minimal_grid() + cowplot::panel_border() +
+  labs(x = "", y = "summed reporter intensity") +
+  theme(axis.text.x = element_blank())
+save_ggplot(sl_plot, "00_sample_loading.png", w = 8, h = 4)
+sl_plot
+
+sl_cv <- sd(colSums(prot.aml, na.rm = TRUE)) / mean(colSums(prot.aml, na.rm = TRUE))
+```
+
+Column-sum CV is `r round(100 * sl_cv, 2)` %. Loading is already equalised across
+all columns, so no sample-loading correction is applied here.
+
+<!--
+  IF SAMPLE LOADING WERE *NOT* EQUALISED (a large CV), you would add an SL step
+  here, BEFORE IRS, scaling each column to a common target. Uncomment to use:
+
+  target     <- exp(mean(log(colSums(prot.aml, na.rm = TRUE))))  # geometric-mean target
+  sl_factors <- target / colSums(prot.aml, na.rm = TRUE)
+  prot.aml   <- sweep(prot.aml, 2, sl_factors, "*")              # scale each column
+
+  SL equalises totals within a plex; IRS (below) aligns plexes to each other.
+  Doing them out of order mixes the two corrections.
+-->
+
+#### Internal reference scaling (IRS)
+
+The pooled reference is the same sample in every plex, so any difference in its
+measured value between plexes is pure batch effect. The ratio that pulls the
+reference to a common level is the ratio that corrects the real samples in that
+plex.
+
+This section adapts to the input. If a reference channel is present (the pre-IRS
+and post-IRS files), it computes IRS and applies it. If no reference channel is
+present (the plain file), it cannot recompute IRS, so it instead verifies
+alignment diagnostically, by checking that the spread of a protein between plexes
+is no larger than the spread between the two injections of one plex.
+
+```{r irs-reference-channel, fig.height=4}
+# AIM: align the plexes. Two paths depending on the input:
+#   with a reference channel -> compute and apply reference-channel IRS
+#   without one              -> verify alignment diagnostically (no change made)
+# has_reference is TRUE when channel-11 columns were found during import.
+has_reference <- ncol(prot.ref) > 0
+
+# helper: CV across plexes per protein (used by both paths).
+cv_across_plexes <- function(m) {
+  lin <- 2^m
+  matrixStats::rowSds(lin, na.rm = TRUE) / rowMeans(lin, na.rm = TRUE)
+}
+
+if (has_reference) {
+
+  ref.log <- log2(prot.ref)            # log2: multiplicative -> additive
+  plex_keys <- unique(ref.meta$plex_key)
+
+  # per-plex reference profile: average the two injections of each plex.
+  ref.by.plex <- purrr::map(set_names(plex_keys), function(p) {
+    cols <- ref.meta$sample[ref.meta$plex_key == p]
+    rowMeans(ref.log[, cols, drop = FALSE], na.rm = TRUE)
+  })
+  ref.mat    <- do.call(cbind, ref.by.plex)          # proteins x plexes
+  target.log <- rowMeans(ref.mat, na.rm = TRUE)       # per-protein target
+  # per-plex, per-protein scaling in log2 = target - that plex's reference
+  scale.log  <- purrr::map(set_names(plex_keys), function(p) target.log - ref.by.plex[[p]])
+  ref.corrected <- do.call(cbind, purrr::map(plex_keys, ~ ref.by.plex[[.x]] + scale.log[[.x]]))
+
+  irs_plot <- tibble(stage = rep(c("before IRS", "after IRS"), each = nrow(ref.mat)),
+                     cv = c(cv_across_plexes(ref.mat), cv_across_plexes(ref.corrected))) %>%
+    tidyr::drop_na() %>%
+    mutate(stage = factor(stage, levels = c("before IRS", "after IRS"))) %>%
+    ggplot(aes(x = stage, y = cv, fill = stage)) +
+    geom_violin() + scale_y_continuous(labels = scales::percent) +
+    cowplot::theme_cowplot() + theme(legend.position = "none") +
+    labs(x = "", y = "reference CV across plexes",
+         title = "Reference alignment before and after IRS")
+
+  # apply the scaling to the biological matrix, per plex.
+  prot.aml.log <- log2(prot.aml)
+  for (p in plex_keys) {
+    cols <- colnames(prot.aml.log)[str_detect(colnames(prot.aml.log), paste0("_", p, "$"))]
+    prot.aml.log[, cols] <- prot.aml.log[, cols] + scale.log[[p]]
+  }
+  prot.aml <- 2^prot.aml.log          # IRS-corrected biology, carried forward
+  median_abs_scale <- median(abs(unlist(scale.log)), na.rm = TRUE)
+  irs_status <- paste0("Reference channel found. IRS applied; median absolute ",
+                       "scaling ", round(median_abs_scale, 3), " log2 units.")
+
+} else {
+
+  # DIAGNOSTIC PATH: no reference channel, so IRS cannot be recomputed. Compare
+  # the between-plex spread of each protein to the between-injection spread. If
+  # the plexes are already aligned, the two are of similar size.
+  block_means <- meta.cols %>%
+    group_by(plex_key, replicate) %>%
+    group_map(~ tibble(uniprotid = rownames(prot.aml),
+                       block = paste(.y$replicate, .y$plex_key, sep = "_"),
+                       mean_log2 = rowMeans(log2(prot.aml[, .x$sample, drop = FALSE])))) %>%
+    bind_rows() %>% pivot_wider(names_from = block, values_from = mean_log2) %>% drop_na()
+  between_block_sd <- block_means %>% dplyr::select(-uniprotid) %>% as.matrix() %>% matrixStats::rowSds()
+  within_plex_sd <- map_dbl(unique(meta.cols$plex_key), function(p)
+    sd(block_means[[paste0("R1_", p)]] - block_means[[paste0("R2_", p)]]))
+
+  irs_plot <- tibble(source = c(rep("between plex blocks", length(between_block_sd)),
+                                rep("between injections", length(within_plex_sd))),
+                     sd = c(between_block_sd, within_plex_sd)) %>%
+    ggplot(aes(x = source, y = sd, fill = source)) +
+    geom_violin() + cowplot::theme_cowplot() + theme(legend.position = "none") +
+    labs(x = "", y = "SD of per-protein mean log2",
+         title = "Plex alignment (diagnostic, no reference channel)")
+  irs_status <- paste0("No reference channel in this file. IRS was verified ",
+                       "diagnostically and the matrix was left unchanged.")
+}
+
+save_ggplot(irs_plot, "01_irs_alignment.png", w = 6, h = 4)
+irs_plot
+```
+
+`r irs_status` On the pre-IRS file the correction is clearly non-zero and the
+before/after violins separate. On the post-IRS or plain file it is near zero or
+absent, which is how the report shows alignment was already in place. A reference
+channel can only correct a plex where the protein was measured, so proteins absent
+from a whole plex stay uncorrected there; this is why missingness and IRS are
+discussed together.
+
+### Investigation
+
+```{r log-and-merge}
+# AIM: put data on log2 scale and average the two injections of each sample into
+# one column, so prot.aml.merge has one column per biological sample (66).
+
+prot.aml.log <- log2(prot.aml)
+
+prot.aml.merge <- meta.aml %>%
+  rowwise() %>%
+  group_map(~ rowMeans(prot.aml.log[, c(paste0(.x$channel, " R1_", .x$plex_key),
+                                        paste0(.x$channel, " R2_", .x$plex_key))],
+                       na.rm = TRUE)) %>%
+  bind_cols() %>% as.matrix()
+colnames(prot.aml.merge) <- meta.aml$label_id
+rownames(prot.aml.merge) <- rownames(prot.aml.log)
+prot.aml.merge[is.nan(prot.aml.merge)] <- NA_real_   # 0/0 average -> proper NA
+```
+
+#### Missing values
+
+```{r missing-per-protein}
+# AIM: measure per-protein missingness and see how many exceed the 50% cutoff.
+missingness_by_protein <- tibble(
+  uniprotid = rownames(prot.aml.merge),
+  no_missing = 100 * rowSums(is.na(prot.aml.merge)) / ncol(prot.aml.merge))
+
+missingness_by_protein %>%
+  ggplot(aes(x = no_missing, fill = no_missing > params_local$max_missing)) +
+  geom_histogram(position = position_identity(), bins = 30) +
+  cowplot::theme_minimal_grid() + cowplot::panel_border() +
+  theme(legend.position = "none") +
+  labs(x = "Percent missing", y = "",
+       caption = paste0("blue = missing in more than ", params_local$max_missing,
+                        "% of samples"))
+```
+
+```{r filter-impact}
+# AIM: show how many proteins survive at different cutoffs, then apply the 50% one.
+tibble(max_missing = c(50, 30, 20, 10, 0)) %>%
+  dplyr::mutate(n_proteins = map_int(max_missing,
+                              ~ sum(missingness_by_protein$no_missing <= .x))) %>%
+  dt_table()
+
+high_missingness_proteins <- missingness_by_protein %>%
+  dplyr::filter(no_missing > params_local$max_missing) %>% pull(uniprotid)
+
+prot.aml.merge.filtered <-
+  prot.aml.merge[!rownames(prot.aml.merge) %in% high_missingness_proteins, ]
+```
+
+#### Replicate agreement
+
+```{r replicate-agreement}
+# AIM: measure how well a sample's two injections agree. High agreement confirms
+# they are technical repeats, so averaging them is valid.
+replicate_agreement <- meta.aml %>%
+  rowwise() %>%
+  dplyr::mutate(
+    r = cor(prot.aml.log[, paste0(channel, " R1_", plex_key)],
+            prot.aml.log[, paste0(channel, " R2_", plex_key)], use = "complete.obs")) %>%
+  ungroup() %>%
+  dplyr::select(label_id, tube_id, subtype, plex, r)
+
+# save the per-sample QC table (replicate agreement) to results/tables.
+replicate_agreement %>%
+  dplyr::mutate(r = round(r, 4)) %>%
+  save_table("sample_qc_replicate_agreement.csv") %>%
+  dt_table()
+```
+
+#### Pattern of missingness
+
+```{r missingness-blockwise}
+# AIM: describe the missingness pattern per plex-run block. Most missingness is
+# blockwise (a protein is measured in a whole plex block or in none of it), which
+# is why we filter rather than impute. Note the "partly_missing" column: it is
+# small but not zero, so the "whole plex" description is a good approximation, not
+# an absolute rule.
+meta.cols %>%
+  group_by(plex_key, replicate) %>%
+  group_modify(function(g, key) {
+    m <- is.na(log2(prot.aml)[, g$sample, drop = FALSE])
+    n <- rowSums(m)
+    tibble(block_size = ncol(m),
+           all_missing = sum(n == ncol(m)),
+           none_missing = sum(n == 0),
+           partly_missing = sum(n > 0 & n < ncol(m)))
+  }) %>% ungroup() %>% dt_table()
+```
+
+Missingness falls mostly in whole plex-run blocks, so the practical unit of
+missingness is the plex, not the sample. Imputing a whole-block value would mean
+inventing a plex of data, so no imputation is done. If a future dataset instead
+showed mostly scattered, within-block missingness, imputation would become
+defensible and the method should be chosen from the mechanism (left-censored
+MNAR methods such as MinProb/QRILC for below-detection missingness; a neighbour
+method such as KNN for missing-at-random).
+
+#### Principal component analysis
+
+```{r pca}
+# AIM: compress the proteins to a few summary axes and plot samples on the first
+# two, coloured by subtype and by plex, to see whether biology or plex drives the
+# variation.
+
+pca_fit <- prot.aml.merge.filtered %>% t() %>% pcaMethods::pca(nPcs = 10)
+pca_scores <- pcaMethods::scores(pca_fit) %>% as_tibble(rownames = "label_id") %>%
+  dplyr::left_join(meta.aml, by = "label_id")
+var_explained <- round(100 * pca_fit@R2, 1)
+
+p <- pca_scores %>%
+  ggplot(aes(x = PC1, y = PC2, col = subtype)) +
+  geom_point(size = 2.5) +
+  labs(x = paste0("PC1, ", var_explained[1], "%"),
+       y = paste0("PC2, ", var_explained[2], "%")) +
+  cowplot::theme_minimal_grid() + cowplot::panel_border()
+ggExtra::ggMarginal(p, groupFill = TRUE, groupColour = TRUE)
+
+pca_plex_plot <- pca_scores %>%
+  ggplot(aes(x = PC1, y = PC2, col = factor(plex))) +
+  geom_point(size = 2.5) + scale_color_viridis_d(name = "Plex") +
+  labs(x = paste0("PC1, ", var_explained[1], "%"),
+       y = paste0("PC2, ", var_explained[2], "%")) +
+  cowplot::theme_minimal_grid() + cowplot::panel_border()
+save_ggplot(pca_plex_plot, "02_pca_by_plex.png", w = 7, h = 5)
+pca_plex_plot
+```
+
+#### Plex and subtype confounding
+
+```{r confounding}
+# AIM: quantify how tangled subtype and plex are. Cramér's V runs 0 (independent)
+# to 1 (perfectly associated).
+confounding_table <- table(meta.aml$subtype, meta.aml$plex)
+confounding_table
+
+cramers_v <- function(tab) {
+  chi <- suppressWarnings(chisq.test(tab)$statistic)
+  as.numeric(sqrt(chi / (sum(tab) * (min(dim(tab)) - 1))))
+}
+```
+
+Cramér's V between subtype and plex is `r round(cramers_v(confounding_table), 2)`.
+Because subtypes sit inside single plexes, plex cannot simply be adjusted for and
+batch-correction on plex would delete biology. The one exception is plex 7.
+
+<!--
+  IF subtype were spread across plexes (a LOW Cramér's V), you could instead
+  adjust for plex directly, e.g. model.matrix(~ subtype + plex) in a limma fit,
+  or limma::removeBatchEffect(mat, batch = plex) for visualisation only. That is
+  NOT valid here because subtype and plex are confounded.
+-->
+
+```{r plex7}
+# AIM: show plex 7, the only plex holding both controls and disease. With 6
+# controls and 3 disease samples, it gives a plex-effect-free comparison used in
+# the second report.
+meta.aml %>% dplyr::filter(plex == 7) %>%
+  dplyr::select(label_id, tube_id, subtype, group) %>% dt_table()
+```
+
+## Summary and export
+
+```{r summary-numbers}
+n_samples  <- ncol(prot.aml.merge.filtered)
+n_proteins <- nrow(prot.aml.merge.filtered)
+```
+
+The dataset comprises `r n_samples` samples with `r n_proteins` proteins retained
+after the missingness filter. Sample loading was verified and internal reference
+scaling was applied using the pooled reference channel. The two injections per
+sample agree closely (mean r `r round(mean(replicate_agreement$r), 3)`) and were
+averaged. No values were imputed. The dominant limitation is subtype-plex
+confounding; plex 7 provides the one plex-effect-free contrast.
+
+```{r export}
+# AIM: bundle the corrected matrix, sample metadata and protein annotation into a
+# SummarizedExperiment and save it for report 2.
+meta.export <- meta.aml %>%
+  dplyr::filter(label_id %in% colnames(prot.aml.merge.filtered)) %>%
+  column_to_rownames("label_id")
+
+aml.summarizedExperiment <- SummarizedExperiment::SummarizedExperiment(
+  assays = list("protein_unimputed" = prot.aml.merge.filtered),
+  colData = meta.export[colnames(prot.aml.merge.filtered), ],
+  rowData = prot.annotation[match(rownames(prot.aml.merge.filtered),
+                                  prot.annotation$uniprotid), ])
+
+saveRDS(aml.summarizedExperiment,
+        file.path(params_local$out_dir,
+                  paste0(Sys.Date(), "_pedPMSproteomics.summarizedExperiment.RDS")))
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
