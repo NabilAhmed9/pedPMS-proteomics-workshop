@@ -1,6 +1,6 @@
 ---
 title: "pedPMS Proteomics 1: Import, QC and reference-channel IRS (workshop)"
-author: "Workshop"
+author: "Nabil Ahmed"
 date: today
 format:
   html:
@@ -37,7 +37,7 @@ editor: source
                                 below does real work. Use this to LEARN IRS.
     - pedPMS_data_postIRS.txt : reference present, already aligned. IRS below is
                                 almost a no-op. Use this to VERIFY IRS was done.
-    - pedPMS_data.txt         : no reference channel. IRS cannot be recomputed;
+    - pedPMS_data.txt         : no reference channel. 
                                 the script verifies alignment diagnostically.
   The same code runs on any of them; only the story changes.
 -->
