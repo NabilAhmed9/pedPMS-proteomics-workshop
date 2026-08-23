@@ -13,7 +13,7 @@ Everything needed to run it, including the data, is in this repository.
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/pedPMS-proteomics-workshop.git
+git clone https://github.com/NabilAhmed9/pedPMS-proteomics-workshop.git
 cd pedPMS-proteomics-workshop
 ```
 

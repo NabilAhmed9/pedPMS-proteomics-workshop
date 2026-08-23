@@ -37,7 +37,7 @@ installing RStudio is usually enough. Check with `quarto --version` in a termina
 Clone the workshop repository. In a terminal:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/pedPMS-proteomics-workshop.git
+git clone https://github.com/NabilAhmed9/pedPMS-proteomics-workshop.git
 ```
 
 This gives you everything you need in one folder, including the data:
