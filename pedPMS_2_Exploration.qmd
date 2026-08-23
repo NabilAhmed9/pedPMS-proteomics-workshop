@@ -1,6 +1,6 @@
 ---
 title: "pedPMS Proteomics 2: Exploration and analysis (workshop)"
-author: "Workshop"
+author: "Nabil Ahmed"
 date: today
 format:
   html:
@@ -53,8 +53,8 @@ library(igraph)                # graph tools + community detection
 library(ComplexHeatmap)        # signature heatmap
 library(circlize)              # colorRamp2(): heatmap colour scale
 library(clusterProfiler)       # enrichGO(), bitr(): enrichment + ID conversion
-library(org.Hs.eg.db)          # human gene annotation database
-library(ReactomePA)            # enrichPathway(): Reactome enrichment (optional)
+library(org.Hs.eg.db)          # human gene annotation database #note: will not work in this script
+library(ReactomePA)            # enrichPathway(): Reactome enrichment (optional) #note: will not work in this script
 library(here)                  # here(): locate the project root portably
 
 # --- Namespace conflicts -------------------------------------------------------
