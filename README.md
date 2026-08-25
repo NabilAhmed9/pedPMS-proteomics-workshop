@@ -171,31 +171,6 @@ Rendering both scripts produces:
 
 ---
 
-## 🏷️ About
-
-### Description
-Synthetic TMT proteomics dataset containing a pooled reference channel and intentional plex-level differences for demonstrating internal reference scaling (IRS).
-
-### Topics
-`proteomics` `tmt` `mass-spectrometry` `batch-correction` `internal-reference-scaling` `irs` `r` `quarto` `bioconductor` `bioinformatics` `teaching` `workshop`
-
-### Resources
-- **Readme**: This file
-- **Wiki**: See [`WORKSHOP_GUIDE.md`](WORKSHOP_GUIDE.md) for the full tutorial
-
-### Activity
-- **Stars**: 0 ⭐ — *Star this repo if you find it useful!*
-- **Watchers**: 0 👁️
-- **Forks**: 0 🍴
-
-### Releases
-No releases published yet. [Create a new release](https://github.com/NabilAhmed9/pedPMS-proteomics-workshop/releases/new)
-
-### Packages
-No packages published yet.
-
----
-
 ## 📚 Citation
 
 If you use this workshop or dataset in your research or teaching, please cite it as:
