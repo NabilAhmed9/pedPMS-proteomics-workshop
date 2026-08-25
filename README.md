@@ -1,11 +1,12 @@
-# 🧬 TMT Proteomics Analysis Workshop
+# 🧬 pedPMS Proteomics Workshop
 
-> A hands-on, two-part R/Quarto workshop for end-to-end TMT proteomics data analysis — from raw intensities to biological interpretation.
+> **Synthetic TMT proteomics dataset containing a pooled reference channel and intentional plex-level differences for demonstrating internal reference scaling (IRS).**
 
 [![R](https://img.shields.io/badge/R-%3E%3D4.2-blue?logo=r)](https://www.r-project.org/)
 [![Quarto](https://img.shields.io/badge/Quarto-1.x-75AADB?logo=quarto)](https://quarto.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-ready-brightgreen)]()
+[![Render](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-black?logo=githubactions)]()
 
 ---
 
@@ -23,10 +24,31 @@ It covers setup, biology, TMT concepts, step-by-step walkthroughs, expected outp
 | **Import & QC** | Load TMT intensity matrices, build sample metadata, and check data quality |
 | **Batch correction** | Apply Internal Reference Scaling (IRS) to align plexes and remove batch effects |
 | **Exploratory analysis** | Run PCA, cluster samples by protein profile, and identify signature proteins |
-| **Pathway enrichment** | Test signature proteins for GO/ Reactome pathway over-representation |
+| **Pathway enrichment** | Test signature proteins for GO / Reactome pathway over-representation |
 | **Confounder-aware comparison** | Run a plex-effect-free healthy-vs-disease comparison in a controlled subset |
 
 The dataset is **fully synthetic** — no real patient, disease, or protein data — but its statistical structure (batch effects, blockwise missingness, plex-subtype confounding) is realistic, so every skill transfers directly to real experiments.
+
+---
+
+## 🗺️ Analysis Workflow
+
+```mermaid
+flowchart TD
+    A["📁 Raw Data<br/>pedPMS_data_preIRS.txt<br/>pedPMS_Samples.csv"] --> B["📜 Script 1<br/>pedPMS_1_Import_QC_IRS.qmd"]
+    B --> C["🔍 Import & QC"]
+    C --> D["⚖️ Sample Loading Check"]
+    D --> E["🔧 Internal Reference Scaling (IRS)"]
+    E --> F["📊 PCA & Confounding Check"]
+    F --> G["💾 SummarizedExperiment<br/>saved to results/"]
+    G --> H["📜 Script 2<br/>pedPMS_2_Exploration.qmd"]
+    H --> I["🔗 Graph-based Clustering"]
+    I --> J["🔥 Signature Heatmaps"]
+    J --> K["🧬 GO / Reactome Enrichment"]
+    K --> L["⚗️ Plex-7 Healthy vs Disease"]
+    L --> M["📈 Volcano Plot & Tables"]
+    M --> N["📄 HTML Reports + CSV/PNG Outputs"]
+```
 
 ---
 
@@ -136,6 +158,62 @@ See **Section 10** of [`WORKSHOP_GUIDE.md`](WORKSHOP_GUIDE.md) for more details.
 
 ---
 
+## 📊 Outputs
+
+Rendering both scripts produces:
+
+| Output | Location | Description |
+|--------|----------|-------------|
+| HTML reports | Repo root (`*.html`) | Self-contained, reproducible reports |
+| SummarizedExperiment | `results/*.rds` | Cleaned data object for downstream use |
+| Tables | `results/tables/*.csv` | Signature proteins, p-values, FDR, GO enrichment, plex-7 results |
+| Figures | `results/figures/*.png` | Sample-loading plots, IRS alignment, PCA, heatmaps, volcano plots |
+
+---
+
+## 🏷️ About
+
+### Description
+Synthetic TMT proteomics dataset containing a pooled reference channel and intentional plex-level differences for demonstrating internal reference scaling (IRS).
+
+### Topics
+`proteomics` `tmt` `mass-spectrometry` `batch-correction` `internal-reference-scaling` `irs` `r` `quarto` `bioconductor` `bioinformatics` `teaching` `workshop`
+
+### Resources
+- **Readme**: This file
+- **Wiki**: See [`WORKSHOP_GUIDE.md`](WORKSHOP_GUIDE.md) for the full tutorial
+
+### Activity
+- **Stars**: 0 ⭐ — *Star this repo if you find it useful!*
+- **Watchers**: 0 👁️
+- **Forks**: 0 🍴
+
+### Releases
+No releases published yet. [Create a new release](https://github.com/NabilAhmed9/pedPMS-proteomics-workshop/releases/new)
+
+### Packages
+No packages published yet.
+
+---
+
+## 📚 Citation
+
+If you use this workshop or dataset in your research or teaching, please cite it as:
+
+```bibtex
+@software{pedpms_proteomics_workshop,
+  author       = {Ahmed, Nabil},
+  title        = {pedPMS Proteomics Workshop: A Synthetic TMT Dataset for Teaching Internal Reference Scaling and Confounder-Aware Analysis},
+  year         = {2026},
+  publisher    = {GitHub},
+  journal      = {GitHub repository},
+  howpublished = {\url{https://github.com/NabilAhmed9/pedPMS-proteomics-workshop}},
+  note         = {Synthetic TMT proteomics dataset for teaching IRS, clustering, and pathway analysis.}
+}
+```
+
+---
+
 ## 📄 License
 
 - **Analysis code:** Provided for teaching purposes.
@@ -145,22 +223,4 @@ See **Section 10** of [`WORKSHOP_GUIDE.md`](WORKSHOP_GUIDE.md) for more details.
 
 ## 🙋 Questions or Issues?
 
-Open an issue on GitHub or refer to the detailed troubleshooting section in [`WORKSHOP_GUIDE.md`](WORKSHOP_GUIDE.md).
-```
-
----
-
-### What changed and why
-
-| Improvement | Rationale |
-|-------------|-----------|
-| **Badges** | Instant visual credibility — R version, Quarto, license, status |
-| **"Start Here" banner** | The original buried the guide link; now it's impossible to miss |
-| **"What You'll Learn" table** | Converts the dense paragraph into scannable skills |
-| **Numbered quick-start** | Easier to follow than a block of text + code |
-| **Warning callout for dependency** | Prevents the common mistake of running Script 2 first |
-| **Dataset at a Glance** | Gives readers the numbers upfront so they know if this matches their use case |
-| **Troubleshooting table** | Surfaces the most common errors without forcing users to scroll through the full guide |
-| **Cleaner file tree** | Aligns comments and groups related files visually |
-
-Want me to also add a Mermaid workflow diagram, a "Cite this repository" BibTeX block, or GitHub Actions badges for automated rendering?
+Open an [issue](https://github.com/NabilAhmed9/pedPMS-proteomics-workshop/issues) on GitHub or refer to the detailed troubleshooting section in [`WORKSHOP_GUIDE.md`](WORKSHOP_GUIDE.md).
