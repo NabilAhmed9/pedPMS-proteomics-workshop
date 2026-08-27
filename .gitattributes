@@ -1,0 +1,8 @@
+# Ignore data files for language stats
+data_raw/* linguist-vendored
+results/* linguist-vendored
+*.txt linguist-vendored
+*.csv linguist-vendored
+
+# Treat Quarto files as R
+*.qmd linguist-language=R
